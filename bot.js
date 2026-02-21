@@ -13,7 +13,7 @@ export default async function handler(req, res) {
     // WEBHOOK SETUP (GET)
     if (req.method === 'GET') {
         const host = req.headers.host;
-        const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=https://${host}/api/bot`);
+        const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=https://${host}/bot`);
         const data = await response.json();
         return res.status(200).json(data);
     }
