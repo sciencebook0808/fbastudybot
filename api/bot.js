@@ -92,7 +92,7 @@ export default async function handler(req, res) {
 
 // --- AI BRAIN (Gemini 3 Flash) ---
 async function getGeminiResponse(apiKey, prompt, isInline = false) {
-    const MODEL = "gemini-2.5-flash"; 
+    const MODEL = "gemma-3-27b-it"; 
     const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
     
     const context = isInline ? "Give a concise 1-paragraph summary." : "You are an expert tutor for Class 8-10.";
