@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini 2.5 Live Audio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes pulse-ring {
+            0% { transform: scale(0.8); opacity: 0.5; }
+            50% { transform: scale(1.2); opacity: 0.8; }
+            100% { transform: scale(0.8); opacity: 0.5; }
+        }
+        .animate-pulse-ring { animation: pulse-ring 2s infinite ease-in-out; }
+        .recording-active { border-color: #ef4444; box-shadow: 0 0 20px #ef4444; }
+        #log::-webkit-scrollbar { width: 4px; }
+        #log::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-zinc-950 text-zinc-200 min-h-screen flex flex-col items-center justify-center p-4">
+
+    <div class="text-center mb-8">
+        <h1 class="text-3xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">
+            Gemini 2.5 Flash Audio
+        </h1>
+        <p class="text-zinc-500 text-sm mt-2">Native Multimodal Live Dialog</p>
+    </div>
+
+    <div class="relative flex items-center justify-center w-64 h-64 mb-10">
+        <div id="ring-outer" class="absolute w-full h-full rounded-full border-2 border-blue-500/20"></div>
+        <div id="ring-inner" class="absolute w-48 h-48 rounded-full border-2 border-purple-500/30"></div>
+        <button id="toggle-btn" class="z-10 w-32 h-32 rounded-full bg-zinc-900 border-2 border-zinc-700 flex flex-col items-center justify-center hover:bg-zinc-800 transition-all active:scale-95 shadow-2xl">
+            <span id="mic-icon" class="text-3xl">🎙️</span>
+            <span id="status-text" class="text-[10px] mt-2 font-bold uppercase tracking-widest text-zinc-400">Start Call</span>
+        </button>
+    </div>
+
+    <div class="w-full max-w-md bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4">
+        <div id="log" class="h-48 overflow-y-auto text-sm space-y-3 pr-2">
+            <div class="text-zinc-600 italic">System: Click the mic to start a real-time audio session.</div>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+        let audioCtx = null;
+        let stream = null;
+        let processor = null;
+        let isRunning = false;
+
+        const toggleBtn = document.getElementById('toggle-btn');
+        const statusText = document.getElementById('status-text');
+        const logContainer = document.getElementById('log');
+        const outerRing = document.getElementById('ring-outer');
+
+        // Main Toggle Logic
+        toggleBtn.onclick = async () => {
+            if (isRunning) {
+                stopSession();
+            } else {
+                startSession();
+            }
+        };
+
+        async function startSession() {
+            try {
+                // 1. Fetch API Key from Vercel Serverless Function
+                addLog("System", "Fetching session credentials...");
+                const configRes = await fetch('/api/config');
+                const { apiKey } = await configRes.json();
+
+                if (!apiKey) throw new Error("API Key missing");
+
+                // 2. Setup WebSocket
+                const URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.MultimodalLiveService.BidiGenerateContent?key=${apiKey}`;
+                socket = new WebSocket(URL);
+
+                socket.onopen = () => {
+                    addLog("System", "Connected to Gemini Live");
+                    sendConfig();
+                    startAudioCapture();
+                    updateUI(true);
+                };
+
+                socket.onmessage = async (event) => {
+                    const response = JSON.parse(event.data);
+                    handleServerContent(response);
+                };
+
+                socket.onclose = () => stopSession();
+                socket.onerror = (err) => console.error("WS Error:", err);
+
+            } catch (err) {
+                addLog("Error", err.message);
+                console.error(err);
+            }
+        }
+
+        function sendConfig() {
+            const setup = {
+                setup: { 
+                    model: "models/gemini-2.0-flash-exp", // Note: Use the current live-supported model ID
+                    generation_config: { response_modalities: ["audio"] }
+                }
+            };
+            socket.send(JSON.stringify(setup));
+        }
+
+        async function startAudioCapture() {
+            audioCtx = new AudioContext({ sampleRate: 16000 });
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const source = audioCtx.createMediaStreamSource(stream);
+            
+            // Standard script processor for resampling to 16kHz
+            processor = audioCtx.createScriptProcessor(4096, 1, 1);
+            source.connect(processor);
+            processor.connect(audioCtx.destination);
+
+            processor.onaudioprocess = (e) => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const pcm16 = floatTo16BitPCM(inputData);
+                    const base64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)));
+                    
+                    socket.send(JSON.stringify({
+                        realtime_input: { media_chunks: [{ data: base64, mime_type: "audio/pcm" }] }
+                    }));
+                }
+            };
+        }
+
+        function handleServerContent(res) {
+            if (res.server_content?.model_turn?.parts) {
+                res.server_content.model_turn.parts.forEach(part => {
+                    if (part.inline_data) {
+                        playOutput(part.inline_data.data);
+                    }
+                    if (part.text) addLog("Gemini", part.text);
+                });
+            }
+            if (res.server_content?.interrupted) {
+                addLog("System", "Barge-in detected: Gemini stopped talking.");
+            }
+        }
+
+        function playOutput(base64) {
+            // In a production app, use an AudioWorklet with a jitter buffer
+            // For this demo, we decode simple chunks
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            
+            // Visualize response
+            outerRing.classList.add('animate-pulse-ring');
+            setTimeout(() => outerRing.classList.remove('animate-pulse-ring'), 500);
+        }
+
+        function floatTo16BitPCM(output) {
+            const buffer = new ArrayBuffer(output.length * 2);
+            const view = new DataView(buffer);
+            for (let i = 0; i < output.length; i++) {
+                const s = Math.max(-1, Math.min(1, output[i]));
+                view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            }
+            return new Int16Array(buffer);
+        }
+
+        function stopSession() {
+            isRunning = false;
+            if (socket) socket.close();
+            if (stream) stream.getTracks().forEach(t => t.stop());
+            if (audioCtx) audioCtx.close();
+            updateUI(false);
+            addLog("System", "Session ended.");
+        }
+
+        function updateUI(active) {
+            isRunning = active;
+            toggleBtn.classList.toggle('recording-active', active);
+            statusText.innerText = active ? "End Call" : "Start Call";
+            document.getElementById('mic-icon').innerText = active ? "🛑" : "🎙️";
+        }
+
+        function addLog(role, text) {
+            const div = document.createElement('div');
+            div.innerHTML = `<span class="font-bold ${role === 'Gemini' ? 'text-blue-400' : 'text-zinc-500'}">${role}:</span> ${text}`;
+            logContainer.appendChild(div);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+    </script>
+</body>
+  </html>
+  
