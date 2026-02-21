@@ -1,151 +1,139 @@
 /**
- * Vercel Serverless Function: AI Study Agent
- * Features: Group Tagging Logic & Private DM Support
+ * Vercel Serverless Function: AI Study Agent (v3.0)
+ * Features: Group Tagging, Private DM, & Inline Search Mode
  */
 
 export default async function handler(req, res) {
     const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    const BOT_USERNAME = process.env.BOT_USERNAME; // Pulled from Vercel Env
+    const BOT_USERNAME = process.env.BOT_USERNAME;
 
-    if (!TELEGRAM_TOKEN || !GEMINI_API_KEY) {
-        return res.status(500).json({ error: "Missing API Keys" });
-    }
+    if (!TELEGRAM_TOKEN || !GEMINI_API_KEY) return res.status(500).json({ error: "Missing Keys" });
 
-    // WEBHOOK SETUP ROUTE
+    // WEBHOOK SETUP (GET)
     if (req.method === 'GET') {
-        try {
-            const host = req.headers.host;
-            const setupUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=https://${host}/api/bot`;
-            const response = await fetch(setupUrl);
-            const data = await response.json();
-            return res.status(200).json({ status: "Webhook Configured", details: data });
-        } catch (error) {
-            return res.status(500).json({ error: "Setup failed", details: error.message });
-        }
+        const host = req.headers.host;
+        const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=https://${host}/api/bot`);
+        const data = await response.json();
+        return res.status(200).json(data);
     }
 
-    // MESSAGE HANDLING ROUTE
+    // MESSAGE HANDLING (POST)
     if (req.method === 'POST') {
         const update = req.body;
         if (!update) return res.status(200).send('No body');
 
+        // --- 1. HANDLE INLINE QUERIES (@botname query) ---
+        if (update.inline_query) {
+            const queryId = update.inline_query.id;
+            const queryText = update.inline_query.query;
+
+            if (queryText.length < 3) return res.status(200).send('Too short');
+
+            try {
+                // Generate a quick AI summary for inline result
+                const ai = await getGeminiResponse(GEMINI_API_KEY, `Quick summary: ${queryText}`, true);
+                
+                await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerInlineQuery`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        inline_query_id: queryId,
+                        results: [{
+                            type: 'article',
+                            id: queryId,
+                            title: `AI Explanation: ${queryText}`,
+                            description: ai.text.substring(0, 100).replace(/<[^>]*>/g, ''), // Plain text for preview
+                            input_message_content: {
+                                message_text: `<b>Topic:</b> ${queryText}\n\n${ai.text}`,
+                                parse_mode: 'HTML'
+                            }
+                        }],
+                        cache_time: 300
+                    })
+                });
+                return res.status(200).send('OK');
+            } catch (e) { return res.status(200).send('Inline Error'); }
+        }
+
+        // --- 2. HANDLE STANDARD MESSAGES (DMs & Groups) ---
         const chatId = update.message?.chat.id || update.callback_query?.message.chat.id;
         const chatType = update.message?.chat.type || update.callback_query?.message.chat.type;
         let userText = update.message?.text || update.callback_query?.data;
 
         if (!chatId || !userText) return res.status(200).send('Ignored');
 
-        // --- GROUP CHAT LOGIC ---
-        if (chatType === 'group' || chatType === 'supergroup') {
-            // If the bot isn't tagged, ignore the message completely
-            if (!BOT_USERNAME || !userText.includes(`@${BOT_USERNAME}`)) {
-                return res.status(200).send('Ignored: Bot not tagged in group');
-            }
-
-            // Remove the bot's username from the text so the AI doesn't get confused
+        // Group filtering: Only respond if tagged
+        if ((chatType === 'group' || chatType === 'supergroup') && BOT_USERNAME) {
+            if (!userText.includes(`@${BOT_USERNAME}`)) return res.status(200).send('Not tagged');
             userText = userText.replace(`@${BOT_USERNAME}`, '').trim();
-
-            // If they just tagged the bot without asking anything
-            if (userText === '') {
-                await sendTelegramMessage(TELEGRAM_TOKEN, chatId, "Yes? How can I help you? 🤓");
-                return res.status(200).send('OK');
-            }
         }
 
         try {
-            await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendChatAction`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, action: 'typing' })
-            });
+            await sendAction(TELEGRAM_TOKEN, chatId, 'typing');
 
-            // Handle Commands
-            if (userText === '/start' || userText === `/start@${BOT_USERNAME}`) {
+            if (userText === '/start') {
                 await sendTelegramMessage(TELEGRAM_TOKEN, chatId, 
-                    "🧬 <b>Welcome to the AI Study Hub!</b>\n\nI am your fast, background tutor. I can explain science, solve math, or create custom quizzes.\n\n<i>What are we learning today?</i>",
-                    ["Class 10 Math 📐", "Physics Lab 🧪", "Quick Quiz 🧠"]
+                    "🧬 <b>Study Agent v3 Active</b>\n\nAsk me anything! In groups, tag me. To share answers, type <code>@fbastudybot</code> in any chat.",
+                    ["Quick Quiz 🧠", "Math Help 📐"]
                 );
                 return res.status(200).send('OK');
             }
 
-            // Fetch AI Response
             const aiResponse = await getGeminiResponse(GEMINI_API_KEY, userText);
             await sendTelegramMessage(TELEGRAM_TOKEN, chatId, aiResponse.text, aiResponse.options);
 
-            return res.status(200).send('OK');
-
         } catch (error) {
-            console.error("Bot Execution Error:", error);
-            await sendTelegramMessage(TELEGRAM_TOKEN, chatId, 
-                `⚠️ <b>System Alert</b>\nMy brain had a small hiccup.\n\n<i>Log: ${error.message}</i>`,
-                ["Main Menu 🏠"]
-            );
-            return res.status(200).send('Error handled');
+            console.error("Error:", error);
         }
+        return res.status(200).send('OK');
     }
-
-    return res.status(405).send('Method Not Allowed');
 }
 
-// --- AI BRAIN LOGIC ---
-async function getGeminiResponse(apiKey, prompt) {
-    const MODEL = "gemini-3-flash"; 
+// --- AI BRAIN (Gemini 3 Flash) ---
+async function getGeminiResponse(apiKey, prompt, isInline = false) {
+    const MODEL = "gemini-2.5-flash"; 
     const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
     
-    const systemPrompt = `
-        You are a Class 8-10 Study Agent. User Query: "${prompt}"
-        Rules:
-        1. Keep it concise. Use HTML tags (<b>, <i>, <code>).
-        2. ALWAYS return your output as a valid JSON object.
-        3. Format: {"text": "your educational response", "options": ["Follow up 1", "Follow up 2"]}
-    `;
+    const context = isInline ? "Give a concise 1-paragraph summary." : "You are an expert tutor for Class 8-10.";
 
-    const response = await fetch(API_URL, {
+    const body = {
+        contents: [{ parts: [{ text: `${context} Query: "${prompt}". Return JSON: {"text": "...", "options": ["Topic1", "Topic2"]}` }] }]
+    };
+
+    const res = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: systemPrompt }] }] })
+        body: JSON.stringify(body)
     });
 
-    if (!response.ok) throw new Error(`Gemini API Error: ${response.statusText}`);
-
-    const data = await response.json();
-    const rawText = data.candidates[0].content.parts[0].text;
-    
-    const cleanJsonString = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
+    const data = await res.json();
+    const raw = data.candidates[0].content.parts[0].text.replace(/```json|```/g, "").trim();
     
     try {
-        return JSON.parse(cleanJsonString);
-    } catch (parseError) {
-        return {
-            text: `<b>Here is what I found:</b>\n\n${rawText}`,
-            options: ["Next Topic", "Main Menu 🏠"]
-        };
+        return JSON.parse(raw);
+    } catch (e) {
+        return { text: raw, options: ["Help", "Menu"] };
     }
 }
 
-// --- TELEGRAM UI LOGIC ---
+// --- TELEGRAM UTILS ---
 async function sendTelegramMessage(token, chatId, text, buttons = []) {
-    const inlineKeyboard = [];
-    
-    if (buttons && buttons.length > 0) {
-        for (let i = 0; i < buttons.length; i += 2) {
-            const row = [{ text: buttons[i], callback_data: buttons[i] }];
-            if (buttons[i + 1]) row.push({ text: buttons[i + 1], callback_data: buttons[i + 1] });
-            inlineKeyboard.push(row);
-        }
-    }
-
-    const payload = {
-        chat_id: chatId,
-        text: text,
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: inlineKeyboard }
-    };
-
+    const keyboard = buttons.map(b => [{ text: b, callback_data: b }]);
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+            chat_id: chatId, text, parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: keyboard }
+        })
     });
-          }
+}
+
+async function sendAction(token, chatId, action) {
+    await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, action })
+    });
+            }
